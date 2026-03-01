@@ -1,5 +1,4 @@
 from datetime import datetime
-
 from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 
