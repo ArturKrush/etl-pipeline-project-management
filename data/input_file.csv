@@ -1,3 +1,16 @@
-column1,column2
-file_value1,file_value2
-file_value3,file_value4
+id,Name,Description,StartDate,EndDate,Manager,Field,Status,Cost,Benefit
+201,Executive Hiring,Searching for new CTO,2024-04-01,2024-08-01,Amanda Waller,Talent Acquisition,Active,30000,0
+202,Logistics Optimization,Supply chain routing AI,2024-06-15,,Steven Wong,Data Analysis,Suspended,55000,120000
+203,,,2024-05-01,,Robert Jenkins,Management,Active,5000,0
+204,Organic Lead Gen,,2024-02-01,2024-12-31,Lucas Pierce,SEO,Active,15000,60000
+205,Microservices Pivot,Breaking down the monolith,2024-01-10,,Marcus Johnson,Development,Active,200000,400000
+206,-Bad Syntax Project,No description here,2024-07-01,,Emily Chen,Development,Unknown,10000,0
+207,Office Relocation,Moving HQ to new building,2024-09-01,,Robert Jenkins,,Active,500000,0
+208,Old CRM Sunset,Deprecating Siebel,2020-05-01,,,,,0,0
+209,Performance Review System,Custom internal app,2024-03-01,2024-08-01,Emily Chen,Development,Completed,40000,20000
+210,Competitor Benchmarking,Q2 Analysis report,2024-04-10,2024-05-10,Steven Wong,Data Analysis,Completed,8000,15000
+211,Executive Hiring,Searching for new CTO,2024-04-01,2024-08-01,Amanda Waller,Talent Acquisition,Active,30000,0
+212,Blog Content Revamp,Updating 100 top articles,2024-05-15,,Lucas Pierce,Content Strategy,Active,12000,30000
+213,Applicant Tracking Update,Workday integration,2024-08-01,,Diana Prince,Talent Acquisition,Suspended,25000,50000
+214,IT Helpdesk Automation,ServiceNow workflow,2024-02-15,2024-06-15,Marcus Johnson,Development,Completed,35000,80000
+215,Leadership Retreat 2024,Offsite event planning,2024-10-01,2024-10-05,Amanda Waller,Management,Active,45000,0
