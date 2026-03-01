@@ -4,10 +4,10 @@ import re
 
 import pandas as pd
 import pymongo
-import uuid_utils as uuid
 from airflow.models import Variable
 from sqlalchemy import create_engine
 from sqlalchemy.engine.url import URL
+import uuid_utils as uuid
 
 from config import POSTGRES_CONFIG, MYSQL_CONFIG, MONGO_CONFIG, LOCAL_FILE_PATH
 
@@ -104,54 +104,74 @@ def transform_data(extract_task_ids, **kwargs):
             data_frames.append(df)
 
         df_combined = pd.concat(data_frames, ignore_index=True)
-        logging.info(f"Combined DataFrame created. Rows: {len(df_combined)}")
+        logging.info(f"Combined DataFrame created. Total rows: {len(df_combined)}")
 
         # 1. Trim spaces in text columns immediately
         for col in ['Name', 'Description', 'Field']:
             if col in df_combined.columns:
                 df_combined[col] = df_combined[col].astype(str).str.strip()
-                # Replace empty strings and 'nan' string back to real NaN
                 df_combined[col] = df_combined[col].replace({'nan': pd.NA, '': pd.NA})
 
-        # 2. Drop full duplicates across all columns
-        df_combined.drop_duplicates(inplace=True)
-        logging.info(f"Rows after dropping full duplicates: {len(df_combined)}")
+        # 2. Drop duplicates by specific subset
+        duplicates = df_combined[df_combined.duplicated(subset=['Name', 'Manager', 'StartDate'], keep='first')]
+        if not duplicates.empty:
+            logging.info(f"Dropped {len(duplicates)} duplicated rows. Dropped rows:\n{duplicates.to_string()}")
+        df_combined.drop_duplicates(subset=['Name', 'Manager', 'StartDate'], inplace=True)
 
-        # Drop old source 'id' column as it's no longer needed
-        if 'id' in df_combined.columns:
-            df_combined.drop(columns=['id'], inplace=True)
-
-        # 3. New Filter Rule: ((Valid Name OR Description) AND Field)
+        # 3. New Filter Rule: Tag invalid names first, then filter
         name_pattern = re.compile(r"^[a-zA-Z][a-zA-Z0-9\s.,?%!-]*$")
 
-        # Determine valid names. If invalid, replace with NA.
-        is_name_format_valid = df_combined['Name'].notna() & df_combined['Name'].str.match(name_pattern)
-        invalid_names = df_combined['Name'].notna() & ~is_name_format_valid
-        if invalid_names.sum() > 0:
-            logging.warning(f"Found {invalid_names.sum()} rows with invalid Names. Setting them to NULL.")
-            df_combined.loc[invalid_names, 'Name'] = pd.NA
+        # Крок 3.1: Визначаємо, які імена валідні, а які ні
+        is_valid_name = df_combined['Name'].notna() & df_combined['Name'].astype(str).str.match(name_pattern)
+        invalid_mask = ~is_valid_name
 
-        # Create boolean masks for the condition
-        has_name = df_combined['Name'].notna()
+        # Крок 3.2: Логуємо та тегуємо невалідні імена ДО фільтрації
+        for idx, row in df_combined[invalid_mask].iterrows():
+            source_id = str(row.get('id', 'Unknown'))
+            orig_name = str(row['Name']) if pd.notna(row['Name']) else "EMPTY"
+            logging.warning(f"Invalid Project Name found for SourceId {source_id}: '{orig_name}'")
+
+        # Векторизована заміна імен (працює миттєво замість apply)
+        df_combined.loc[invalid_mask, 'Name'] = "[INVALID NAME] FOR: " + df_combined['id'].astype(str).fillna('Unknown')
+
+        # Крок 3.3: Створюємо маски для інших умов
         has_desc = df_combined['Description'].notna()
         has_field = df_combined['Field'].notna()
 
-        # Apply the rule: ((Name OR Desc) AND Field)
-        keep_mask_1 = (has_name | has_desc) & has_field
-        df_combined = df_combined[keep_mask_1]
-        logging.info(f"Rows after (Name/Desc + Field) filter: {len(df_combined)}")
+        # Застосовуємо правило: ((Valid Name OR Has Desc) AND Has Field)
+        keep_mask_1 = (is_valid_name | has_desc) & has_field
 
-        # 4. Old Filter rule: Drop if NO Manager AND NO Status AND StartDate is NOT in the future
-        df_combined['StartDate'] = pd.to_datetime(df_combined['StartDate'], errors='coerce')
-        current_date = pd.Timestamp.now()
+        # Крок 3.4: Відкидаємо рядки та виводимо їх у лог
+        dropped_rule_1 = df_combined[~keep_mask_1]
+        if not dropped_rule_1.empty:
+            logging.info(
+                f"Dropped {len(dropped_rule_1)} rows failing (Name/Desc + Field) rule. Dropped rows:\n{dropped_rule_1.to_string()}")
+
+        # Залишаємо лише валідні рядки
+        df_combined = df_combined[keep_mask_1].copy()
+
+        # Drop old source 'id' column as we already used it for logging
+        if 'id' in df_combined.columns:
+            df_combined.drop(columns=['id'], inplace=True)
+
+            # 4. Old Filter rule: Drop if NO Manager AND NO Status AND StartDate is NOT in the future
+            # Додано utc=True для безпечного змішування дат з Mongo та CSV
+            df_combined['StartDate'] = pd.to_datetime(
+                df_combined['StartDate'], format='mixed', errors='coerce', utc=True).dt.tz_localize(None)
+            current_date = pd.Timestamp.now()
 
         drop_mask_2 = (
                 df_combined['Manager'].isna() &
                 df_combined['Status'].isna() &
                 ((df_combined['StartDate'] <= current_date) | df_combined['StartDate'].isna())
         )
-        df_combined = df_combined[~drop_mask_2]
-        logging.info(f"Rows after Manager/Status/StartDate filter: {len(df_combined)}")
+
+        dropped_rule_2 = df_combined[drop_mask_2]
+        if not dropped_rule_2.empty:
+            logging.info(
+                f"Dropped {len(dropped_rule_2)} rows failing Manager/Status/StartDate rule. Dropped rows:\n{dropped_rule_2.to_string()}")
+
+        df_combined = df_combined[~drop_mask_2].copy()
 
         # 5. Parse Cost and Benefit to positive float
         for col in ['Cost', 'Benefit']:
@@ -188,8 +208,11 @@ def load_to_mysql(**kwargs):
 
     try:
         df = pd.read_csv(transformed_file_path)
-        df['StartDate'] = pd.to_datetime(df['StartDate'], errors='coerce')
-        df['EndDate'] = pd.to_datetime(df['EndDate'], errors='coerce')
+        # Додано utc=True
+        df['StartDate'] = pd.to_datetime(
+            df['StartDate'], format='mixed', errors='coerce', utc=True).dt.tz_localize(None)
+        df['EndDate'] = pd.to_datetime(
+            df['EndDate'], format='mixed', errors='coerce', utc=True).dt.tz_localize(None)
 
         mysql_url = URL.create(
             drivername='mysql+mysqlconnector',
@@ -203,7 +226,6 @@ def load_to_mysql(**kwargs):
         target_table = Variable.get('target_table', default_var='final_table')
 
         # --- DYNAMIC LOOKUP LOGIC ---
-        # Parameter 'column_name' removed as requested
         def sync_lookup_table(table_name, df_column):
             """Reads lookup table, inserts missing values, and returns an id mapping dictionary."""
             existing_df = pd.read_sql(f"SELECT Id, Name FROM {table_name}", engine)
@@ -225,6 +247,7 @@ def load_to_mysql(**kwargs):
         manager_map = sync_lookup_table('Managers', 'Manager')
         df['ManagerId'] = df['Manager'].map(manager_map)
 
+        # Повернуто вашу чисту логіку без зайвого 'Unknown'
         field_map = sync_lookup_table('Fields', 'Field')
         df['FieldId'] = df['Field'].map(field_map)
 
@@ -237,38 +260,45 @@ def load_to_mysql(**kwargs):
                          'ManagerId', 'FieldId', 'StatusId', 'Cost', 'Benefit']
         df_final = df[final_columns].copy()
 
-        # Ensure NOT NULL constraints for MySQL
         not_null_cols = ['ProjectKey', 'FieldId', 'StatusId', 'StartDate']
-        valid_rows = df_final.dropna(subset=not_null_cols)
-        df_final = valid_rows
 
-        # --- DATABASE DEDUPLICATION ---
-        # Read existing records to prevent duplicates on multiple runs
+        # --- ДОДАНО/ЗМІНЕНО: Додано логування перед dropna, щоб точно знати, якщо якісь рядки відсіються ---
+        before_drop_count = len(df_final)
+        df_final = df_final.dropna(subset=not_null_cols)
+        after_drop_count = len(df_final)
+        if before_drop_count != after_drop_count:
+            logging.warning(
+                f"Dropped {before_drop_count - after_drop_count} rows due to missing NOT NULL values in DB mapping (Columns: {not_null_cols}).")
+
+        # --- SIMPLIFIED DATABASE DEDUPLICATION ---
         try:
             query = f"SELECT Name, ManagerId, StartDate FROM {target_table}"
             db_existing_df = pd.read_sql(query, engine)
 
             if not db_existing_df.empty:
-                # Merge to find which rows already exist
-                # Convert StartDate to string for safer comparison
-                df_final['StartDate_str'] = df_final['StartDate'].astype(str)
-                db_existing_df['StartDate_str'] = pd.to_datetime(db_existing_df['StartDate']).astype(str)
+                # Helper function to create a text key for comparison
+                def make_key(row):
+                    name = str(row['Name']) if pd.notna(row['Name']) else ""
+                    return f"{name}|{row['ManagerId']}|{row['StartDate']}"
 
-                # We use fillna('') for Name because merge doesn't match on NaNs
-                merged = df_final.assign(Name_merge=df_final['Name'].fillna('__NULL__')).merge(
-                    db_existing_df.assign(Name_merge=db_existing_df['Name'].fillna('__NULL__')),
-                    on=['Name_merge', 'ManagerId', 'StartDate_str'],
-                    how='left',
-                    indicator=True
-                )
+                # Create a set of keys that already exist in the database
+                existing_keys = set(db_existing_df.apply(make_key, axis=1))
 
-                # Keep only rows that are left_only (not in database)
-                df_final = df_final[merged['_merge'] == 'left_only'].drop(columns=['StartDate_str'])
-                logging.info(f"Rows left after DB deduplication: {len(df_final)}")
+                # Apply the same key to our current DataFrame
+                df_final['temp_key'] = df_final.apply(make_key, axis=1)
+
+                # Find and log rows that we are going to skip
+                duplicates_db = df_final[df_final['temp_key'].isin(existing_keys)]
+                if not duplicates_db.empty:
+                    logging.info(f"Filtered out {len(duplicates_db)} rows already existing in MySQL.")
+
+                # Keep only rows whose keys are NOT in existing_keys
+                df_final = df_final[~df_final['temp_key'].isin(existing_keys)].copy()
+                df_final.drop(columns=['temp_key'], inplace=True)
             else:
                 logging.info("Target table is empty. Skipping DB deduplication.")
         except Exception as e:
-            logging.warning(f"Could not perform DB deduplication (maybe table doesn't exist yet): {e}")
+            logging.warning(f"Could not perform DB deduplication (table might not exist yet): {e}")
 
         if df_final.empty:
             logging.info("No new data to insert into MySQL.")
