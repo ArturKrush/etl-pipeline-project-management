@@ -8,10 +8,10 @@ CREATE TABLE source_table (
     Field VARCHAR(100),
     Status VARCHAR(50),
     Cost VARCHAR(50),
-    Benefit VARCHAR(50)
+    Income VARCHAR(50)
 );
 
-INSERT INTO source_table (Name, Description, StartDate, EndDate, Manager, Field, Status, Cost, Benefit) VALUES
+INSERT INTO source_table (Name, Description, StartDate, EndDate, Manager, Field, Status, Cost, Income) VALUES
 ('Cloud Infrastructure Migration', 'Moving core services to AWS', '2024-01-15', NULL, 'Marcus Johnson', 'Development', 'Active', '150000', '300000'),
 ('Customer Segmentation Model', 'K-means clustering for marketing', '2024-02-01', '2024-05-01', 'Steven Wong', 'Data Analysis', 'Completed', '45000', '120000'),
 ('1st Quarter Brand Audit', NULL, '2024-03-10', NULL, 'Emily Chen', 'Content Strategy', 'Active', '12000', '0'), -- БИТИЙ: Назва з цифри ТА немає опису -> ВИДАЛИТЬСЯ

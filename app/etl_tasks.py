@@ -99,18 +99,37 @@ def transform_data(extract_task_ids, **kwargs):
 
     data_frames = []
     try:
+        # Словник для стандартизації колонок (всі ключі в нижньому регістрі)
+        column_mapping = {
+            'id': 'id',
+            'name': 'Name',
+            'description': 'Description',
+            'startdate': 'StartDate',
+            'enddate': 'EndDate',
+            'manager': 'Manager',
+            'field': 'Field',
+            'status': 'Status',
+            'cost': 'Cost',
+            'income': 'Income'
+        }
+
         for file_path in file_paths:
             df = pd.read_csv(file_path)
+            # Тимчасово переводимо всі назви колонок у нижній регістр
+            # (щоб зрівняти Postgres, Mongo та CSV)
+            df.columns = df.columns.str.lower()
+            # Перейменовуємо на наш єдиний стандарт
+            df.rename(columns=column_mapping, inplace=True)
             data_frames.append(df)
 
         df_combined = pd.concat(data_frames, ignore_index=True)
         logging.info(f"Combined DataFrame created. Total rows: {len(df_combined)}")
 
         # 1. Trim spaces in text columns immediately
-        for col in ['Name', 'Description', 'Field']:
+        for col in ['Name', 'Description', 'Field', 'Manager', 'Status']:
             if col in df_combined.columns:
                 df_combined[col] = df_combined[col].astype(str).str.strip()
-                df_combined[col] = df_combined[col].replace({'nan': pd.NA, '': pd.NA})
+                df_combined[col] = df_combined[col].replace({'nan': pd.NA, '': pd.NA, 'None': pd.NA})
 
         # 2. Drop duplicates by specific subset
         duplicates = df_combined[df_combined.duplicated(subset=['Name', 'Manager', 'StartDate'], keep='first')]
@@ -119,72 +138,72 @@ def transform_data(extract_task_ids, **kwargs):
         df_combined.drop_duplicates(subset=['Name', 'Manager', 'StartDate'], inplace=True)
 
         # 3. New Filter Rule: Tag invalid names first, then filter
+        # Регулярний вираз для перевірки Name
         name_pattern = re.compile(r"^[a-zA-Z][a-zA-Z0-9\s.,?%!-]*$")
-
-        # Крок 3.1: Визначаємо, які імена валідні, а які ні
+        # Створення маски на основі непустих та валідних комірок Name
         is_valid_name = df_combined['Name'].notna() & df_combined['Name'].astype(str).str.match(name_pattern)
+        # Інвертація для отримання невалідних та пустих комірок Name
         invalid_mask = ~is_valid_name
-
-        # Крок 3.2: Логуємо та тегуємо невалідні імена ДО фільтрації
+        # Прохід по проблемних рядках та логування інформації про невалідні та пусті рядки
         for idx, row in df_combined[invalid_mask].iterrows():
             source_id = str(row.get('id', 'Unknown'))
             orig_name = str(row['Name']) if pd.notna(row['Name']) else "EMPTY"
             logging.warning(f"Invalid Project Name found for SourceId {source_id}: '{orig_name}'")
-
-        # Векторизована заміна імен (працює миттєво замість apply)
-        df_combined.loc[invalid_mask, 'Name'] = "[INVALID NAME] FOR: " + df_combined['id'].astype(str).fillna('Unknown')
-
-        # Крок 3.3: Створюємо маски для інших умов
+        # Маска рядків з непустими комірками Description
         has_desc = df_combined['Description'].notna()
-        has_field = df_combined['Field'].notna()
-
-        # Застосовуємо правило: ((Valid Name OR Has Desc) AND Has Field)
-        keep_mask_1 = (is_valid_name | has_desc) & has_field
-
-        # Крок 3.4: Відкидаємо рядки та виводимо їх у лог
-        dropped_rule_1 = df_combined[~keep_mask_1]
+        # Правило 1: Видаляємо, якщо Name невалідний/пустий І Description пустий
+        drop_mask_name_desc = invalid_mask & ~has_desc
+        dropped_rule_1 = df_combined[drop_mask_name_desc]
         if not dropped_rule_1.empty:
             logging.info(
-                f"Dropped {len(dropped_rule_1)} rows failing (Name/Desc + Field) rule. Dropped rows:\n{dropped_rule_1.to_string()}")
+                f"Dropped {len(dropped_rule_1)} rows failing Rule 1 (Invalid/Empty Name AND Empty Description). Dropped rows:\n{dropped_rule_1.to_string()}")
+        df_combined = df_combined[~drop_mask_name_desc].copy()
 
-        # Залишаємо лише валідні рядки
-        df_combined = df_combined[keep_mask_1].copy()
+        # Правило 2: Видаляємо, якщо Field пусте
+        # Формування маски з рядків, де відсутнє значення стовпця Field
+        drop_mask_field = df_combined['Field'].isna()
+        # Виділення рядків, що не пройшли фільтрацію 2-м правилом
+        dropped_rule_2 = df_combined[drop_mask_field]
+        if not dropped_rule_2.empty:
+            logging.info(
+                f"Dropped {len(dropped_rule_2)} rows failing Rule 2 (Empty Field)."
+                f"Dropped rows:\n{dropped_rule_2.to_string()}")
+        # Надалі проходять лише ті рядки, що пройшли фільтрацію
+        df_combined = df_combined[~drop_mask_field].copy()
 
-        # Drop old source 'id' column as we already used it for logging
-        if 'id' in df_combined.columns:
-            df_combined.drop(columns=['id'], inplace=True)
-
-            # 4. Old Filter rule: Drop if NO Manager AND NO Status AND StartDate is NOT in the future
-            # Додано utc=True для безпечного змішування дат з Mongo та CSV
-            df_combined['StartDate'] = pd.to_datetime(
-                df_combined['StartDate'], format='mixed', errors='coerce', utc=True).dt.tz_localize(None)
-            current_date = pd.Timestamp.now()
-
+        # 4. Правило 3: Drop if NO Manager AND NO Status AND StartDate is NOT in the future
+        # Додано utc=True для безпечного змішування дат з Mongo та CSV
+        df_combined['StartDate'] = pd.to_datetime(df_combined['StartDate'],
+            format='mixed', errors='coerce', utc=True).dt.tz_localize(None)
+        current_date = pd.Timestamp.now()
+        # Формування маски, що відкидатиме рядки, де відсутні значення Manager, Status,
+        # а StartDate невалідне або відсутнє
         drop_mask_2 = (
                 df_combined['Manager'].isna() &
                 df_combined['Status'].isna() &
                 ((df_combined['StartDate'] <= current_date) | df_combined['StartDate'].isna())
         )
-
-        dropped_rule_2 = df_combined[drop_mask_2]
-        if not dropped_rule_2.empty:
+        # Виділення рядків, що не пройшли фільтрацію правилом
+        dropped_rule_3 = df_combined[drop_mask_2]
+        if not dropped_rule_3.empty:
             logging.info(
-                f"Dropped {len(dropped_rule_2)} rows failing Manager/Status/StartDate rule. Dropped rows:\n{dropped_rule_2.to_string()}")
-
+                f"Dropped {len(dropped_rule_3)} rows failing Rule 3 (Manager/Status/StartDate). "
+                f"Dropped rows:\n{dropped_rule_3.to_string()}")
+        # Надалі проходять лише ті рядки, що пройшли фільтрацію
         df_combined = df_combined[~drop_mask_2].copy()
 
-        # 5. Parse Cost and Benefit to positive float
-        for col in ['Cost', 'Benefit']:
+        # 5. Parse Cost and Income to positive float
+        for col in ['Cost', 'Income']:
             if col in df_combined.columns:
                 df_combined[col] = pd.to_numeric(df_combined[col].astype(str).str.replace(r'[^\d.]', '', regex=True),
                                                  errors='coerce').abs()
-
-        # 6. Generate UUIDv7 for ProjectKey
+        # 6. Drop old source 'id' column as we already used it for logging
+        if 'id' in df_combined.columns:
+            df_combined.drop(columns=['id'], inplace=True)
+        # 7. Generate UUIDv7 for ProjectKey
         df_combined['ProjectKey'] = [str(uuid.uuid7()) for _ in range(len(df_combined))]
-
         logging.info(f"Data transformed successfully. Final rows: {len(df_combined)}")
-        logging.info(f"Transformed DataFrame (first 6 rows):\n{df_combined.head(6)}")
-
+        # Збереження результату етапу Transform у CSV-файл
         execution_date = kwargs['execution_date'].strftime('%Y%m%dT%H%M%S')
         transformed_file_path = f'/tmp/transformed_data_{execution_date}.csv'
         df_combined.to_csv(transformed_file_path, index=False)
@@ -208,7 +227,6 @@ def load_to_mysql(**kwargs):
 
     try:
         df = pd.read_csv(transformed_file_path)
-        # Додано utc=True
         df['StartDate'] = pd.to_datetime(
             df['StartDate'], format='mixed', errors='coerce', utc=True).dt.tz_localize(None)
         df['EndDate'] = pd.to_datetime(
@@ -225,44 +243,46 @@ def load_to_mysql(**kwargs):
         engine = create_engine(mysql_url)
         target_table = Variable.get('target_table', default_var='final_table')
 
-        # --- DYNAMIC LOOKUP LOGIC ---
+        # DYNAMIC LOOKUP LOGIC
         def sync_lookup_table(table_name, df_column):
             """Reads lookup table, inserts missing values, and returns an id mapping dictionary."""
+            # Читання існуючих даних з Lookup-таблиці
             existing_df = pd.read_sql(f"SELECT Id, Name FROM {table_name}", engine)
+            # Створення словника Name-Id на основі наявних даних у Lookup-таблицях
             existing_map = dict(zip(existing_df['Name'], existing_df['Id']))
-
+            # Виділення лише унікальних непустих значень у вхідних даних
             unique_values = df[df_column].dropna().unique()
-            missing_values = [val for val in unique_values if val not in existing_map]
 
+            # Вставка нових значень, які не були у наявності в Lookup-таблиці
+            missing_values = [val for val in unique_values if val not in existing_map]
             if missing_values:
                 logging.info(f"Inserting {len(missing_values)} new records into {table_name}.")
                 new_records_df = pd.DataFrame({'Name': missing_values})
                 new_records_df.to_sql(name=table_name, con=engine, if_exists='append', index=False)
-
+            # Оновлення та повернення словника Name-Id
                 existing_df = pd.read_sql(f"SELECT Id, Name FROM {table_name}", engine)
                 existing_map = dict(zip(existing_df['Name'], existing_df['Id']))
-
             return existing_map
 
+        # Формування стовпця з id менеджерів
         manager_map = sync_lookup_table('Managers', 'Manager')
         df['ManagerId'] = df['Manager'].map(manager_map)
-
-        # Повернуто вашу чисту логіку без зайвого 'Unknown'
+        # Формування стовпця з id областей діяльності
         field_map = sync_lookup_table('Fields', 'Field')
         df['FieldId'] = df['Field'].map(field_map)
-
+        # Формування стовпця з id статусів та заповнення пустих комірок id, що відповідає 'Unknown'
         status_map = sync_lookup_table('Statuses', 'Status')
         df['StatusId'] = df['Status'].map(status_map)
         df['StatusId'] = df['StatusId'].fillna(status_map.get('Unknown'))
 
-        # --- FINAL PREPARATION ---
+        # FINAL PREPARATION
+        # Вибірка лише вказаних стовпців, текстові Manager, Status, Field відсікаються
         final_columns = ['ProjectKey', 'Name', 'Description', 'StartDate', 'EndDate',
-                         'ManagerId', 'FieldId', 'StatusId', 'Cost', 'Benefit']
+                         'ManagerId', 'FieldId', 'StatusId', 'Cost', 'Income']
         df_final = df[final_columns].copy()
-
+        # Відсікання рядків, де відсутні значення ключових стовпців
         not_null_cols = ['ProjectKey', 'FieldId', 'StatusId', 'StartDate']
-
-        # --- ДОДАНО/ЗМІНЕНО: Додано логування перед dropna, щоб точно знати, якщо якісь рядки відсіються ---
+        # Логування перед dropna, щоб точно знати, якщо якісь рядки відсіються
         before_drop_count = len(df_final)
         df_final = df_final.dropna(subset=not_null_cols)
         after_drop_count = len(df_final)
@@ -270,7 +290,7 @@ def load_to_mysql(**kwargs):
             logging.warning(
                 f"Dropped {before_drop_count - after_drop_count} rows due to missing NOT NULL values in DB mapping (Columns: {not_null_cols}).")
 
-        # --- SIMPLIFIED DATABASE DEDUPLICATION ---
+        # DATABASE DEDUPLICATION
         try:
             query = f"SELECT Name, ManagerId, StartDate FROM {target_table}"
             db_existing_df = pd.read_sql(query, engine)

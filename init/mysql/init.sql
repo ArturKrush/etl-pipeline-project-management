@@ -23,7 +23,7 @@ CREATE TABLE final_table (
     FieldId INT NOT NULL,
     StatusId INT NOT NULL,
     Cost DECIMAL(18,2),
-    Benefit DECIMAL(18,2),
+    Income DECIMAL(18,2),
     FOREIGN KEY (ManagerId) REFERENCES Managers(Id),
     FOREIGN KEY (StatusId) REFERENCES Statuses(Id),
     FOREIGN KEY (FieldId) REFERENCES Fields(Id)
